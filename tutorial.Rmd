@@ -1,0 +1,447 @@
+---
+title: "Demographic Decomposition"
+author: "Tim Riffe"
+date: "9 Nov. 2023"
+output: html_document
+bibliography: references.bib  
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+
+In this tiny tutorial I'd like to demonstrate a few approaches to coding decompositions. We'll cover Kitagawa, Arriaga, and generalized decomposition. This will usually involve function-writing, so for this reason let's review how to write a function. 
+
+## Brief anatomy of function types
+
+ First a standard function
+```{r, eval = FALSE}
+my_function <- function(arg1, arg2, ...){
+  # this is where you calculate things with your arguments,
+  result <- arg1 ^ arg2 + arg1 # bla bla
+  result2 <- arg1 ^3 / arg2
+  # it can be as big and complicated as you want!
+  # here I'm returning an ugly-but-common list
+  out <- list(result1 = result, result2 = result)
+  # eventually calculating a result 
+	return(out)
+}
+
+my_function(arg1 = 4, arg2 = 5)
+```
+
+Second a vector-argument function that gives back a scalar result, the kind we need to generalized decompositions. It's often best to implement these as simple wrappers around your main function doing the calculations of interest.
+```{r}
+my_function_vec <- function(pars, which_result = "result1", ...){
+  arg1 <- pars[1]
+  arg2 <- pars[2]
+  # This version needs to return a single quantity; so you
+  # can set it up by either hard-coding to select a particular result
+  # or you can pass in extra arguments to help select out pieces,
+  # and don't worry because these will not be decomposed. Only parameters
+  # inside pars get decomposed.
+  my_function(arg1 = arg1, arg2 = arg2)[["which_result"]]
+}
+
+```
+
+## Some things to install:
+
+To install packages from github you might need to install the `remotes` package first. If you're on a Windows machine you should also install (RTools)[https://cran.r-project.org/bin/windows/Rtools/] beforehand.
+```{r, message = FALSE}
+# install.packages("remotes")
+# install.packages("tidyverse")
+
+# remotes::install_github("timriffe/DemoDecomp")
+library(tidyverse)
+library(DemoDecomp)     # three generalized decomposition methods
+```
+
+
+## Example data
+
+I've copied raw rates `Mx` and exposures `Px` from 1950 and 2000 Spain, Male, Female, and Total from the [HMD](https://www.mortality.org/). You can read them in like so:
+
+```{r}
+ES <- read_csv("example_data.csv")
+ES
+```
+I've pre-arranged the data to make it easier to do decompositions. We'll compare 2000 with 1950 in the example, so these are found side by side. First some helper functions.
+
+## Small functions
+
+These are some lazy lifetable transformations that we'll use here and there to make things easy. You could swap them out with more rigorous ones. These have names that follow a memorable pattern.
+
+```{r}
+# Use continuous formula in discrete setting,
+# implies error, but small here.
+mx_to_lx <- function(mx){
+  mx[is.na(mx)] <- 0
+  lx <- exp(-cumsum(mx))
+  lx <- c(1,lx)
+  lx[1:length(mx)]
+}
+
+# minus first difference
+lx_to_dx <- function(lx){
+  -diff(c(lx,0))
+}
+
+# Linear approximation
+lx_to_Lx <- function(lx){
+   (lx + c(lx[-1],0)) / 2
+}  
+
+# Can be used to turn Lx into Tx
+rcumsum <- function(x){
+  rev(cumsum(rev(x)))
+}
+
+lx_to_ex <- function(lx){
+  Lx <- lx_to_Lx(lx) # this is "modularity"
+  Tx <- rcumsum(Lx) 
+  ex <- Tx / lx
+  ex
+}
+
+```
+
+Here's some ways to use functions like these
+
+```{r, echo = FALSE}
+mx <- ES %>% 
+  filter(Sex == "Total") %>% 
+  pull(Mx_1950)
+
+plot(mx_to_lx(mx),type='l')
+
+# or in succession 
+mx %>% mx_to_lx() %>% lx_to_ex()
+
+# or in the tidy way:
+ES %>% 
+  group_by(Sex) %>% 
+  mutate(lx_1950 = mx_to_lx(Mx_1950))
+```
+
+## Arriaga
+The so-called [@arriaga1984measuring](https://link.springer.com/article/10.2307/2061029) decomposition technique is used to measure the contribution of differences in each age group to a difference in life expectancy. 
+
+In a paper, you'd probably see the Arriaga-style decomp written out like so (if it's written at all):
+
+$$
+_n\Delta_x = \frac{l_x^{1950} }{l_0^{1950}} \Big( \frac{_nL_x^{2000}}{l_x^{2000}} -\frac{_nL_x^{1950}}{l_x^{1950}} \Big) + \frac{T_{x+n}^{2000}}{l_0^{1950}} \Big( \frac{l_x^{1950}}{l_x^{2000}} - \frac{l_{x+n}^{1950}}{l_{x+n}^{2000}} \Big)
+$$
+Where $_n\Delta_x$ is the contribution to the expectancy difference form mortality differences in age $x$. To keep things legible in the code, we'll call the left side the direct effect and the right side the indirect effect. Age groups are $n$ years wide, and we need that part of the notation to denote the "next" age group. $l$, $L$, and $T$ are the lifetable columns, which we'll approximate with the tiny functions we just wrote. `lead()` is our trick to get to the age group $x+n$. Note, there is a little detail to close out the indirect effect that you'll see in the code.
+
+We'll just generate the columns we need for Arriaga in the tidy way and perform the calcs like so:
+
+```{r}
+
+ES_Arr <- ES %>% 
+  group_by(Sex) %>% 
+  mutate(lx_1950 = mx_to_lx(Mx_1950),
+         lx_2000 = mx_to_lx(Mx_2000),
+         Lx_1950 = lx_to_Lx(lx_1950),
+         Lx_2000 = lx_to_Lx(lx_2000),
+         Tx_1950 = rcumsum(Lx_1950),
+         Tx_2000 = rcumsum(Lx_2000)) %>% 
+  # Now starts the Arriaga decomp, separated, just because
+  
+   mutate(direct = lx_1950 * (Lx_2000 / lx_2000 - Lx_1950 / lx_1950),
+         indirect = lead(Tx_2000) * 
+           (lx_1950 / lx_2000 - 
+              lead(lx_1950) / lead(lx_2000)),
+         # impute 0 in the final NA
+         indirect = ifelse(is.na(indirect), lx_1950 * (Tx_2000 / lx_2000 - Tx_1950 / lx_1950), indirect),
+         total = direct + indirect) %>% 
+  ungroup() |> 
+  select(Sex, Age, direct, indirect, total) 
+
+# verify it gives an exact result:
+ES_Arr %>% 
+  group_by(Sex) %>% 
+  summarize(Delta = sum(total))
+
+# yup
+ES %>% 
+  group_by(Sex) %>% 
+  mutate(ex_1950 = mx_to_lx(Mx_1950) %>% lx_to_ex(),
+         ex_2000 = mx_to_lx(Mx_2000) %>% lx_to_ex(),
+         Delta = ex_2000-ex_1950) %>% 
+  filter(Age == 0) %>% 
+  select(Sex, Delta)
+```
+
+Let's have a look, OK it's mostly infants.
+
+```{r}
+ES_Arr %>% 
+  pivot_longer(direct:total, names_to = "effect", values_to = "cx") %>% 
+  filter(effect != "total") %>% 
+  ggplot(aes(x = Age, y = cx, color = effect)) +
+  geom_line() +
+  facet_wrap(~Sex)
+```
+
+A kinder-to-yourself (more portable, findable) way of doing just the same would make and Arriaga function that just starts from `Mx` values, like so:
+
+```{r}
+my_arriaga <- function(mx1, mx2){
+  lx1 <- mx_to_lx(mx1)
+  lx2 <- mx_to_lx(mx2)
+  Lx1 <- lx_to_Lx(lx1)
+  Lx2 <- lx_to_Lx(lx2)
+  Tx1 <- rcumsum(Lx1)
+  Tx2 <- rcumsum(Lx2)
+  
+  direct   <- lx1 * (Lx2 / lx2 - Lx1 / lx1)
+  indirect <- lead(Tx2) * (lx1 / lx2 - lead(lx1) / lead(lx2))
+         # impute 0 in the final NA
+  indirect <- ifelse(is.na(indirect),0,indirect)
+  total    <- direct + indirect
+  return(total)
+}
+
+# usage:
+ES %>% 
+  group_by(Sex) %>% 
+  mutate(deltax = my_arriaga(Mx_1950, Mx_2000)) %>% 
+  summarize(Delta = sum(deltax)) # same result
+
+```
+
+## Generalized decomposition
+
+I use Arriaga as an example because it's widely taught, it's exact, and because we can replicate it using generalized techniques in order to show that approach. Here we see the usage of three different general decomposition techniques:
+
+- [@horiuchi2008decomposition](https://link.springer.com/article/10.1353/dem.0.0033), with the `horiuchi()` function.
+- [@andreev2002algorithm](https://www.demographic-research.org/volumes/vol7/14/), with the `stepwise_replacement()` function.
+- [@caswell1989analysis](https://www.sciencedirect.com/science/article/abs/pii/0304380089900197), with the `ltre()` function.
+
+I'll give my hot take on the differences between them in the presentation. Their usage is very similar in the `DemoDecomp` package. Each of these methods can do a full parameter decomposition of (arbitrarily) complicated functions. For our Arriaga comparison, we just need to write a function that takes us from a single **vector of parameters** ($M_x$) to the desired result ($e_0$), like so:
+
+```{r}
+mx_to_e0 <- function(mx){
+  mx %>% mx_to_lx %>% lx_to_ex %>% '['(1)
+}
+# usage:
+ES %>% filter(Sex == "Total") %>% pull(Mx_1950) %>% mx_to_e0()
+```
+
+Our arbitrary function becomes an argument to any of the three general decomposition functions:
+```{r}
+# horiuchi, stepwise_replacement, and ltre all come from DemoDecomp
+Dec_compare <-
+  ES %>% 
+  group_by(Sex) %>% 
+  mutate(arr = my_arriaga(Mx_1950, Mx_2000),
+         hor = horiuchi(mx_to_e0, Mx_1950, Mx_2000, N = 20),
+         and = stepwise_replacement(mx_to_e0, Mx_1950, Mx_2000, direction = "both"),
+         cas = ltre(mx_to_e0, Mx_1950, Mx_2000), N = 20) %>% 
+  ungroup() %>% 
+  select(Sex, Age, arr:cas) 
+```
+
+Let's compare:
+```{r}
+# 1) compare sums:
+check_sums <- 
+Dec_compare %>% 
+  ungroup() |> 
+  group_by(Sex) %>% 
+  summarize(arr = sum(arr), 
+            hor = sum(hor),
+            and = sum(and),
+            cas = sum(cas))
+Dec_compare
+```
+Compare age patterns. If you zoom in, you'll see that classic Arriaga is the most different one!! I don't know what to make of it. Is my implementation off, or do we still lack a small adjustment?
+```{r}
+Dec_compare %>% 
+  pivot_longer(arr:cas, 
+               names_to = "method", 
+               values_to = "delta") %>% 
+  ggplot(aes(x = Age, y = delta, color = method)) + 
+  geom_line() +
+  xlim(5,80) +
+  ylim(0,.4) +
+  facet_wrap(~Sex)
+
+```
+
+# Tip re Arriaga
+I mentioned the case of age-cause decompositions, which are common in the literature. Sometimes we have a net change of 0 in a rate, whereas some specific causes increase in decrease in ways that compensate each other. In common textbooks or implementations of this, the decomposition result can explode due to a 0 in the denominator. To avoid this, and probably do a better job, instead:
+1. calculate the sensitivity, which you could do by performing Arriaga or Horiuchi and then dividing by the change in all-cause rates
+2. multiply the sensitivity by the age-cause-specific changes in rates. 
+This will be far more reliable.
+
+# Notes
+Notes: 
+- `horiuchi()` is arbitrarily exact as you increase the parameter `N`, but there is a speed penalty for larger N.
+- the `stepwise_replacement()` algorithm is faster, but the order in which parameters get treated is a parameter you need to set, and which affects results for individual parameter estimates. The sum is always constrained, however.
+- `ltre()` approach can also be faster if you have an analytical partial derivative function, otherwise it uses numerical derivatives under the hood, and these are approximate.
+- analytical solutions are always computationally efficient, but you might need to invent them, so there's that.
+
+
+# The composition problem
+
+This next example will demonstrate how the age-breakdown of the structure component of a Kitagawa-style decomposition is fragile as soon as we start to poke at it. The rate component is just fine, but we can warp the age pattern of the structure component quite easily by simply leaving out arbitrary elements of the decomposition. This is a problem for interpreting such classic decompositions. To be clear, the sum of the structure component is robust, just not the age breakdown of it. Let's see:
+
+## Demonstrate composition problem
+
+First, these are the CDRs we have:
+```{r}
+ES2 <- 
+  ES |> 
+  group_by(Sex) |> 
+  pivot_longer(-c(Sex,Age), names_to = "component_year", values_to = "value") |> 
+  separate(component_year, into = c("component", "year"), sep = "_", convert = TRUE) |> 
+  pivot_wider(names_from = component, values_from = value) |> 
+  group_by(Sex, year) |> 
+  mutate(Px = Px / sum(Px)) 
+
+# check CDR
+ES2 |> 
+  group_by(Sex, year) |> 
+  summarize(CDR = 1000*sum(Mx * Px)) |> 
+  pivot_wider(names_from = year, values_from = CDR)
+```
+
+## demonstrate Kitagawa
+
+In short, @kitagawa1955components separates the effects of structure and age-specific rates on a crude measure. The decomposition approach can be verbalized like so: the difference between two crude rates is the sum of the difference in rates times the average structure (rate effect) and the difference in structure times the average rates (structure effect). Or formally:
+
+$$
+\Delta = \sum \bar{\mu_x} (c_x^2 - c_x^1) + \sum \bar{c_x} (\mu_x^2 - \mu_x^1)
+$$
+Where $\mu_x$ are rates broken down by age (or maybe more) and $c_x$ is the population structure or weights. The left sum is the structure effect and the right sum is the rate effect. These are unproblematic in the margin. But if we're interested in age patterns of these effects $\kappa_x$, then these are only unique for the rate effects. The structure effects do not have a unique age pattern, and that is because $1 = \sum{c_x}$, i.e. it is a composition. Since it's a composition, we can leave out an element without loss of information. That is consequential for decompositions, as I'll demonstrate below. First the basic Kitagawa approach, so that you see it:
+
+```{r}
+ES_kit <-
+  ES |> 
+  group_by(Sex) |> 
+  mutate(cx1 = Px_1950 / sum(Px_1950),
+         cx2 = Px_2000 / sum(Px_2000),
+         mu_bar = (Mx_1950 + Mx_2000)/2,
+         mu_diff = Mx_2000 - Mx_1950,
+         cx_bar = (cx1 + cx2) / 2,
+         cx_diff = cx2 - cx1,
+         rate_effect = mu_diff * cx_bar,
+         structure_effect = cx_diff * mu_bar)
+ES_kit |> 
+  summarize(CDR1 = sum(cx1 * Mx_1950),
+            CDR2 = sum(cx2 * Mx_2000),
+            Delta = CDR2 - CDR1,
+            rate_effect = sum(rate_effect),
+            structure_effect = sum(structure_effect)) |> 
+  mutate(Delta_check = rate_effect + structure_effect)
+```
+
+See how Delta_check is equal to Delta? That demonstrates additivity, woo hoo! The rate effect is unique, so you can look at the age pattern, but now I'd like to demonstrate that the composition effect is not unique. 
+
+## Demonstrate of composition problem in Kitagawa decomposition
+
+For this, we need to implement the idea of leaving out one element of the structure component. Note that Horiuchi gives identical results to Kitagawa (can demonstrate if you like), and for this experiment we need some flexibility, so I'll implement it with Horiuchi.
+
+We need to make a function that skips a given age of structure this needs to be vec already.
+
+```{r}
+# standard CDR calc
+CDR_vec <- function(pars){
+   n         <- length(pars)
+   dim(pars) <- c(n/2,2)
+   sum(pars[,1] * pars[,2])
+}
+
+# CDR vec where one element of theta is simply missing and needs imputation
+CDR_impute_vec <- function(pars, impute = 1){
+   n         <- length(pars)
+   if (impute > 0){
+     n = n + 1
+   }
+   rates  <- pars[1:(n/2)]
+   struct <- rep(0,n/2)
+   struct[-impute] <- pars[(n/2+1):length(pars)]
+   struct[impute]  <- 1 - sum(struct)
+   sum(rates * struct)
+}
+
+# a wrapper function that removes an element of structure, then performs the decomposition,
+# returning kappa (the decomp result) with an NA in place of the imputed element.
+CDR_skip_vec <- function(pars1, pars2, skip = 1, N = 20){
+  n <- length(pars1)
+  skip      <- skip[1]
+  if (skip > 0){
+    pars1     <- pars1[-(n/2 + skip)]
+    pars2     <- pars2[-(n/2 + skip)]
+    kappa     <- horiuchi(CDR_impute_vec, pars1, pars2, impute = skip, N)
+    
+    # plug in an NA in the right spot
+    kappa_out <- rep(0,n)
+    
+    ind <- 1:n == ((n/2) + skip)
+    
+    kappa_out[!ind] <- kappa
+    kappa_out[ind] <- NA
+    return(kappa_out)
+  } else {
+    kappa     <- horiuchi(CDR_vec, pars1, pars2, N)
+    return(kappa)
+  }
+}
+```
+
+For time, we first group ages to five-year age groups, then perform for just one subset, this is actually quite fast. To handle the changing element to skip, we can just expand the data with a join (`cross_join()` does brute expansion like this).
+```{r}
+skips <- tibble(skip = 0:23)
+Dec_skips<-
+  ES2 |> 
+  filter(Sex == "Male") |> 
+  mutate(Dx = Px * Mx,
+         age = Age - Age %% 5) |> 
+  group_by(year, age) |> 
+  summarize(Px = sum(Px),
+            Dx = sum(Dx), .groups = "drop") |> 
+  mutate(Mx = Dx / Px) |> 
+  select(-Dx) |> 
+  pivot_longer(c(Px, Mx), names_to = "component", values_to = "theta") |> 
+  pivot_wider(names_from = year, values_from = theta, names_prefix = "theta") |> 
+  cross_join(skips) |> 
+  arrange(skip,component, age) |> 
+  group_by(skip) |> 
+  mutate(kappa = CDR_skip_vec(theta1950,theta2000, skip = skip, N = 10))
+  
+```
+
+Visualize the conundrum. Age patterns of structure vary wildly depending which element was excluded, whereas age patterns of mortality component remain robust. We highlight the "naive" full parameter version in red. It somehow rides the profile, and it is in this case not an intermediate value. This is not highlighted anywhere in the literature. HT Jonas and Maxi for pointing it out some time ago. It remains unresolved.
+```{r}
+Dec_skips |> 
+  ggplot(aes(x = age, y = kappa, color = as.factor(skip), group = skip)) +
+  geom_line() +
+  facet_wrap(~component) +
+  # add on red line of Kitagawa result
+  geom_line(data = Dec_skips |> filter(skip == 0), color = "red")
+```
+
+Note that compositions maintain their marginal distributions, so it's for sure OK to say "the impact of age structure was X". 
+```{r}
+Dec_skips |> 
+  filter(component == "Px") |> 
+  group_by(skip) |> 
+  summarize(check = sum(kappa, na.rm = TRUE))
+```
+
+\subsection{Where else can this arise?}
+Say you want to decompose a difference arising from a discrete-time multistate model. Analogous composition issues arise with transition probabilities, and for this I advise to decompose with respect to attrition arrows in the state space diagram, and to leave the self-arrows out. Note that this means to construct your transient matrix, you'll need to derive the self arrow transitions again inside your HLE function. I have a manuscript in prep on this specific issue.
+
+
+# References
+
+
+
+
+
+
