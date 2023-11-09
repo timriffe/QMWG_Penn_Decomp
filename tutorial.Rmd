@@ -24,7 +24,7 @@ my_function <- function(arg1, arg2, ...){
   result2 <- arg1 ^3 / arg2
   # it can be as big and complicated as you want!
   # here I'm returning an ugly-but-common list
-  out <- list(result1 = result, result2 = result)
+  out <- list(result1 = result, result2 = result2)
   # eventually calculating a result 
 	return(out)
 }
@@ -33,7 +33,7 @@ my_function(arg1 = 4, arg2 = 5)
 ```
 
 Second a vector-argument function that gives back a scalar result, the kind we need to generalized decompositions. It's often best to implement these as simple wrappers around your main function doing the calculations of interest.
-```{r}
+```{r, eval = FALSE}
 my_function_vec <- function(pars, which_result = "result1", ...){
   arg1 <- pars[1]
   arg2 <- pars[2]
@@ -42,9 +42,10 @@ my_function_vec <- function(pars, which_result = "result1", ...){
   # or you can pass in extra arguments to help select out pieces,
   # and don't worry because these will not be decomposed. Only parameters
   # inside pars get decomposed.
-  my_function(arg1 = arg1, arg2 = arg2)[["which_result"]]
+  my_function(arg1 = arg1, arg2 = arg2)[[which_result]]
 }
-
+my_function(4,5)
+my_function_vec(c(4,5),which_result = "result1")
 ```
 
 ## Some things to install:
@@ -159,7 +160,9 @@ ES_Arr <- ES %>%
          total = direct + indirect) %>% 
   ungroup() |> 
   select(Sex, Age, direct, indirect, total) 
+```
 
+```{r}
 # verify it gives an exact result:
 ES_Arr %>% 
   group_by(Sex) %>% 
@@ -208,7 +211,7 @@ my_arriaga <- function(mx1, mx2){
 # usage:
 ES %>% 
   group_by(Sex) %>% 
-  mutate(deltax = my_arriaga(Mx_1950, Mx_2000)) %>% 
+  mutate(deltax = my_arriaga(Mx_1950, Mx_2000)) |> 
   summarize(Delta = sum(deltax)) # same result
 
 ```
@@ -237,12 +240,14 @@ Our arbitrary function becomes an argument to any of the three general decomposi
 Dec_compare <-
   ES %>% 
   group_by(Sex) %>% 
-  mutate(arr = my_arriaga(Mx_1950, Mx_2000),
+  mutate(arr1 = my_arriaga(Mx_1950, Mx_2000),
+         arr2 = my_arriaga(Mx_2000, Mx_1950),
+         arr_avg = (arr1 + -arr2) / 2,
          hor = horiuchi(mx_to_e0, Mx_1950, Mx_2000, N = 20),
          and = stepwise_replacement(mx_to_e0, Mx_1950, Mx_2000, direction = "both"),
          cas = ltre(mx_to_e0, Mx_1950, Mx_2000), N = 20) %>% 
   ungroup() %>% 
-  select(Sex, Age, arr:cas) 
+  select(Sex, Age, arr1:cas) 
 ```
 
 Let's compare:
@@ -252,7 +257,9 @@ check_sums <-
 Dec_compare %>% 
   ungroup() |> 
   group_by(Sex) %>% 
-  summarize(arr = sum(arr), 
+  summarize(arr1 = sum(arr1), 
+            arr2 = sum(arr2), 
+            arr_avg = sum(arr_avg), 
             hor = sum(hor),
             and = sum(and),
             cas = sum(cas))
@@ -261,7 +268,7 @@ Dec_compare
 Compare age patterns. If you zoom in, you'll see that classic Arriaga is the most different one!! I don't know what to make of it. Is my implementation off, or do we still lack a small adjustment?
 ```{r}
 Dec_compare %>% 
-  pivot_longer(arr:cas, 
+  pivot_longer(arr1:cas, 
                names_to = "method", 
                values_to = "delta") %>% 
   ggplot(aes(x = Age, y = delta, color = method)) + 
@@ -269,14 +276,36 @@ Dec_compare %>%
   xlim(5,80) +
   ylim(0,.4) +
   facet_wrap(~Sex)
-
 ```
+
+Let's look specifically at differences in results, comparing horiuchi with the arriaga variants:
+
+```{r}
+Dec_compare |> 
+  mutate(diff1 = arr1 - hor,
+         diff2 = arr2 - hor,
+         diff_avg = arr_avg- hor) |> 
+  select(Sex, Age, diff1, diff2, diff_avg) |> 
+  pivot_longer(diff1:diff_avg, names_to = "Arriaga variant", values_to = "difference vs Horiuchi") |> 
+  ggplot(aes(x=Age,y=`difference vs Horiuchi`,color = `Arriaga variant`))+
+  geom_line() +
+  facet_wrap(~Sex)
+
+Dec_compare |> 
+  mutate(diff_avg = arr_avg - hor) |> 
+  ggplot(aes(x=Age, y = diff_avg, color =Sex)) +
+  geom_line() +
+  labs(title = "Differences are small but systematic",
+       subtitle = "Possibly Arriaga method needs a closer look")
+```
+
 
 # Tip re Arriaga
 I mentioned the case of age-cause decompositions, which are common in the literature. Sometimes we have a net change of 0 in a rate, whereas some specific causes increase in decrease in ways that compensate each other. In common textbooks or implementations of this, the decomposition result can explode due to a 0 in the denominator. To avoid this, and probably do a better job, instead:
-1. calculate the sensitivity, which you could do by performing Arriaga or Horiuchi and then dividing by the change in all-cause rates
+1. calculate the sensitivity, which you could do by performing Arriaga or Horiuchi and then dividing by the change in all-cause rates.
 2. multiply the sensitivity by the age-cause-specific changes in rates. 
 This will be far more reliable.
+3. I like the symmetrical take on Arriaga, but not the way you see it in the above code. Instead, try converting the `my_arriaga()` function into a sensitivity function, taking a single vector of mortality rates as its argument, and internally converting this into `mx1` and `mx2` by nudging the rates both up and down by a teeny tiny amount (a perturbation factor, and multiplicatively is best). Then calculate the sensitivity per (1) twice, once in each direction, and take the average. Then use this sensitivity function with a very small perturbation factor inside the `ltre()` approach. It's simply wonderful and ca 100 times fater than numerical derivatives.
 
 # Notes
 Notes: 
